@@ -12,12 +12,14 @@ export const OrderCreateSchema = z.object({
   shopifyOrderNumber: z.string().min(1),
   customerName: z.string().optional(),
   notes: z.string().optional(),
-  items: z.array(
-    z.object({
-      sku: z.string().min(1),
-      qty: z.number().int().positive()
-    })
-  ).default([])
+  items: z
+    .array(
+      z.object({
+        sku: z.string().min(1),
+        qty: z.number().int().positive()
+      })
+    )
+    .default([])
 });
 
 export const OrderUpdateSchema = z.object({

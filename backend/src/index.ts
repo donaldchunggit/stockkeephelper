@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
-import { initDb } from "./db.js";
-import { router } from "./routes.js";
+import { initDb } from "./db";
+import { router } from "./route";
 
 initDb();
 

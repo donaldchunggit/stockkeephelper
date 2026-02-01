@@ -1,4 +1,4 @@
-import { db } from "./db.js";
+import { db } from "./db";
 
 /**
  * For now: compute low-stock alerts and store in DB.
@@ -7,10 +7,10 @@ import { db } from "./db.js";
 export function recomputeLowStockAlerts(nowIso: string) {
   const products = db
     .prepare(
-      `SELECT sku, name, on_hand, reorder_point
+      `SELECT sku, name, on_hand as onHand, reorder_point as reorderPoint, reorder_qty as reorderQty
        FROM products`
     )
-    .all() as Array<{ sku: string; name: string; on_hand: number; reorder_point: number }>;
+    .all() as Array<{ sku: string; name: string; onHand: number; reorderPoint: number; reorderQty: number }>;
 
   const upsertAlert = db.prepare(`
     INSERT INTO alerts (sku, type, is_active, triggered_at)
@@ -26,7 +26,7 @@ export function recomputeLowStockAlerts(nowIso: string) {
   `);
 
   for (const p of products) {
-    const isLow = p.on_hand <= p.reorder_point;
+    const isLow = p.onHand <= p.reorderPoint;
     if (isLow) {
       upsertAlert.run({ sku: p.sku, now: nowIso });
       // later: sendSlackLowStock(p)

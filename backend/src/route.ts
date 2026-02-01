@@ -1,8 +1,11 @@
-import { Router } from "express";
-import { db } from "./db.js";
-import { ProductUpsertSchema, OrderCreateSchema, OrderUpdateSchema } from "./validate.js";
-import { parseTracking } from "./tracking.js";
-import { recomputeLowStockAlerts } from "./alerts.js";
+import { Router, type Request, type Response } from "express";
+import multer from "multer";
+
+import { db } from "./db";
+import { ProductUpsertSchema, OrderCreateSchema, OrderUpdateSchema } from "./validate";
+import { parseTracking } from "./tracking";
+import { recomputeLowStockAlerts } from "./alerts";
+import { importOrdersCsv, importProductsCsv } from "./importers";
 
 export const router = Router();
 
@@ -10,21 +13,26 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-// Health
-router.get("/health", (_req, res) => res.json({ ok: true }));
+/* -------------------- Health -------------------- */
+
+router.get("/health", (_req: Request, res: Response) => res.json({ ok: true }));
 
 /* -------------------- Products / Inventory -------------------- */
 
 // List products
-router.get("/products", (_req, res) => {
+router.get("/products", (_req: Request, res: Response) => {
   const rows = db
-    .prepare(`SELECT sku, name, on_hand as onHand, reorder_point as reorderPoint, reorder_qty as reorderQty, updated_at as updatedAt FROM products ORDER BY name`)
+    .prepare(
+      `SELECT sku, name, on_hand as onHand, reorder_point as reorderPoint, reorder_qty as reorderQty, updated_at as updatedAt
+       FROM products
+       ORDER BY name`
+    )
     .all();
   res.json(rows);
 });
 
 // Upsert product
-router.post("/products", (req, res) => {
+router.post("/products", (req: Request, res: Response) => {
   const parsed = ProductUpsertSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
@@ -48,7 +56,7 @@ router.post("/products", (req, res) => {
 });
 
 // Adjust stock (increment/decrement)
-router.post("/products/:sku/adjust", (req, res) => {
+router.post("/products/:sku/adjust", (req: Request, res: Response) => {
   const sku = String(req.params.sku);
   const delta = Number(req.body?.delta);
   if (!Number.isInteger(delta)) return res.status(400).json({ error: "delta must be an integer" });
@@ -57,12 +65,16 @@ router.post("/products/:sku/adjust", (req, res) => {
   const row = db.prepare(`SELECT sku FROM products WHERE sku=?`).get(sku);
   if (!row) return res.status(404).json({ error: "SKU not found" });
 
+  // clamp to >= 0 safely
   db.prepare(`
     UPDATE products
-    SET on_hand = MAX(on_hand + ?, 0),
-        updated_at = ?
+    SET on_hand = CASE
+      WHEN on_hand + ? < 0 THEN 0
+      ELSE on_hand + ?
+    END,
+    updated_at = ?
     WHERE sku = ?
-  `).run(delta, t, sku);
+  `).run(delta, delta, t, sku);
 
   recomputeLowStockAlerts(t);
   res.json({ ok: true });
@@ -70,21 +82,24 @@ router.post("/products/:sku/adjust", (req, res) => {
 
 /* -------------------- Orders -------------------- */
 
-router.get("/orders", (_req, res) => {
-  const orders = db.prepare(`
-    SELECT id, shopify_order_number as shopifyOrderNumber, customer_name as customerName,
-           status, tracking_url as trackingUrl, tracking_number as trackingNumber,
-           courier, notes, created_at as createdAt, updated_at as updatedAt
-    FROM orders
-    ORDER BY created_at DESC
-  `).all();
+router.get("/orders", (_req: Request, res: Response) => {
+  const orders = db
+    .prepare(`
+      SELECT id, shopify_order_number as shopifyOrderNumber, customer_name as customerName,
+             status, tracking_url as trackingUrl, tracking_number as trackingNumber,
+             courier, notes, created_at as createdAt, updated_at as updatedAt
+      FROM orders
+      ORDER BY created_at DESC
+    `)
+    .all();
 
-  // Attach items
   const itemsByOrder = new Map<number, Array<{ sku: string; qty: number }>>();
-  const items = db.prepare(`
-    SELECT order_id as orderId, sku, qty
-    FROM order_items
-  `).all() as Array<{ orderId: number; sku: string; qty: number }>;
+  const items = db
+    .prepare(`
+      SELECT order_id as orderId, sku, qty
+      FROM order_items
+    `)
+    .all() as Array<{ orderId: number; sku: string; qty: number }>;
 
   for (const it of items) {
     if (!itemsByOrder.has(it.orderId)) itemsByOrder.set(it.orderId, []);
@@ -95,7 +110,7 @@ router.get("/orders", (_req, res) => {
   res.json(withItems);
 });
 
-router.post("/orders", (req, res) => {
+router.post("/orders", (req: Request, res: Response) => {
   const parsed = OrderCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
@@ -123,7 +138,6 @@ router.post("/orders", (req, res) => {
 
     for (const it of o.items) {
       insertItem.run({ orderId, sku: it.sku, qty: it.qty });
-      // optional: reserve logic could live here later
     }
     return orderId;
   });
@@ -139,7 +153,7 @@ router.post("/orders", (req, res) => {
   }
 });
 
-router.patch("/orders/:id", (req, res) => {
+router.patch("/orders/:id", (req: Request, res: Response) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id" });
 
@@ -185,20 +199,49 @@ router.patch("/orders/:id", (req, res) => {
   params.push(id);
 
   db.prepare(`UPDATE orders SET ${fields.join(", ")} WHERE id=?`).run(...params);
-
   res.json({ ok: true });
 });
 
 /* -------------------- Alerts -------------------- */
 
-router.get("/alerts/low-stock", (_req, res) => {
-  const rows = db.prepare(`
-    SELECT a.sku, p.name, p.on_hand as onHand, p.reorder_point as reorderPoint, p.reorder_qty as reorderQty,
-           a.is_active as isActive, a.triggered_at as triggeredAt
-    FROM alerts a
-    JOIN products p ON p.sku = a.sku
-    WHERE a.type='LOW_STOCK' AND a.is_active=1
-    ORDER BY p.on_hand ASC, p.name ASC
-  `).all();
+router.get("/alerts/low-stock", (_req: Request, res: Response) => {
+  const rows = db
+    .prepare(`
+      SELECT a.sku, p.name, p.on_hand as onHand, p.reorder_point as reorderPoint, p.reorder_qty as reorderQty,
+             a.is_active as isActive, a.triggered_at as triggeredAt
+      FROM alerts a
+      JOIN products p ON p.sku = a.sku
+      WHERE a.type='LOW_STOCK' AND a.is_active=1
+      ORDER BY p.on_hand ASC, p.name ASC
+    `)
+    .all();
+
   res.json(rows);
+});
+
+/* -------------------- CSV Import -------------------- */
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+router.post("/import/products", upload.single("file"), (req: Request, res: Response) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "Missing file" });
+
+  const csvText = file.buffer.toString("utf-8");
+  const result = importProductsCsv(csvText);
+
+  res.json({ ok: true, ...result });
+});
+
+router.post("/import/orders", upload.single("file"), (req: Request, res: Response) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "Missing file" });
+
+  const csvText = file.buffer.toString("utf-8");
+  const result = importOrdersCsv(csvText);
+
+  res.json({ ok: true, ...result });
 });
